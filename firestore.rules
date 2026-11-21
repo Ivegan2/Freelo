@@ -1,0 +1,160 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function userDoc(uid) {
+      return /databases/$(database)/documents/users/$(uid);
+    }
+
+    function isActiveAdmin() {
+      return signedIn()
+        && exists(userDoc(request.auth.uid))
+        && get(userDoc(request.auth.uid)).data.role == 'admin'
+        && get(userDoc(request.auth.uid)).data.active == true;
+    }
+
+    function isActiveFreelancer() {
+      return signedIn()
+        && exists(userDoc(request.auth.uid))
+        && get(userDoc(request.auth.uid)).data.role == 'freelancer'
+        && get(userDoc(request.auth.uid)).data.active == true;
+    }
+
+    function isActiveClient() {
+      return signedIn()
+        && exists(userDoc(request.auth.uid))
+        && get(userDoc(request.auth.uid)).data.role == 'client'
+        && get(userDoc(request.auth.uid)).data.active == true;
+    }
+
+    match /users/{userId} {
+      allow create: if isActiveAdmin()
+        || (signedIn()
+          && request.auth.uid == userId
+          && request.resource.data.role in ['client', 'freelancer']
+          && request.resource.data.active == true
+          && request.resource.data.keys().hasOnly([
+            'uid', 'name', 'email', 'phone', 'role', 'active', 'photoUrl',
+            'bio', 'location', 'specialties', 'isPublic', 'createdAt', 'updatedAt'
+          ]));
+
+      allow get: if signedIn() && (
+        request.auth.uid == userId
+        || isActiveAdmin()
+        || (resource.data.role == 'freelancer' && resource.data.isPublic == true)
+      );
+      allow list: if isActiveAdmin();
+
+      allow update: if isActiveAdmin()
+        || (signedIn()
+          && request.auth.uid == userId
+          && request.resource.data.role == resource.data.role
+          && request.resource.data.active == resource.data.active
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'name', 'phone', 'photoUrl', 'bio', 'location', 'specialties', 'isPublic', 'updatedAt'
+          ]));
+
+      allow delete: if isActiveAdmin();
+    }
+
+    match /services/{serviceId} {
+      allow read: if resource.data.status == 'published'
+        || (signedIn() && resource.data.ownerId == request.auth.uid)
+        || isActiveAdmin();
+
+      allow create: if isActiveFreelancer()
+        && request.resource.data.ownerId == request.auth.uid
+        && request.resource.data.status in ['draft', 'pending']
+        && request.resource.data.price is number
+        && request.resource.data.price > 0;
+
+      allow update: if isActiveAdmin()
+        || (isActiveFreelancer()
+          && resource.data.ownerId == request.auth.uid
+          && request.resource.data.ownerId == resource.data.ownerId
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'title', 'description', 'categoryId', 'price', 'imageUrls', 'availability', 'status', 'updatedAt'
+          ])
+          && (request.resource.data.status == resource.data.status
+            || request.resource.data.status in ['draft', 'pending', 'paused']));
+
+      allow delete: if isActiveAdmin()
+        || (isActiveFreelancer() && resource.data.ownerId == request.auth.uid);
+    }
+
+    match /carts/{userId}/items/{itemId} {
+      allow read, create, update, delete: if signedIn() && request.auth.uid == userId;
+    }
+
+    match /orders/{orderId} {
+      allow read: if isActiveAdmin()
+        || (signedIn() && (
+          resource.data.clientId == request.auth.uid
+          || resource.data.freelancerId == request.auth.uid
+        ));
+
+      allow create: if isActiveClient()
+        && request.resource.data.clientId == request.auth.uid
+        && request.resource.data.status == 'pending'
+        && request.resource.data.paymentStatus == 'pending'
+        && request.resource.data.keys().hasOnly([
+          'clientId', 'freelancerId', 'items', 'subtotal', 'commission', 'total',
+          'address', 'latitude', 'longitude', 'status', 'paymentStatus', 'createdAt', 'updatedAt'
+        ]);
+
+      // Payment status and provider references are updated only by trusted backend code.
+      allow update: if isActiveAdmin()
+        || (signedIn()
+          && resource.data.freelancerId == request.auth.uid
+          && request.resource.data.paymentStatus == resource.data.paymentStatus
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'status', 'sellerNote', 'updatedAt'
+          ]))
+        || (signedIn()
+          && resource.data.clientId == request.auth.uid
+          && resource.data.status == 'pending'
+          && request.resource.data.status == 'cancelled'
+          && request.resource.data.paymentStatus == resource.data.paymentStatus
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt']));
+
+      allow delete: if isActiveAdmin()
+        && resource.data.paymentStatus == 'pending';
+    }
+
+    match /reports/{reportId} {
+      allow create: if signedIn()
+        && request.resource.data.reporterId == request.auth.uid
+        && request.resource.data.status == 'open';
+      allow read, update, delete: if isActiveAdmin();
+    }
+
+    match /conversations/{conversationId} {
+      allow create: if signedIn() && request.resource.data.members is list
+        && request.auth.uid in request.resource.data.members;
+      allow read: if signedIn() && request.auth.uid in resource.data.members;
+      allow update: if signedIn() && request.auth.uid in resource.data.members
+        && request.resource.data.members == resource.data.members;
+      allow delete: if isActiveAdmin();
+
+      match /messages/{messageId} {
+        function isConversationMember() {
+          return signedIn()
+            && request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.members;
+        }
+        allow read: if isConversationMember();
+        allow create: if isConversationMember()
+          && request.resource.data.senderId == request.auth.uid
+          && request.resource.data.text is string
+          && request.resource.data.text.size() > 0;
+        allow update, delete: if false;
+      }
+    }
+    match /auditLogs/{logId} {
+      allow read: if isActiveAdmin();
+      allow write: if false;
+    }
+  }
+}
