@@ -1,8 +1,9 @@
 package com.example.freelo
 
 import android.os.Bundle
-import androidx.activity.ComponentActivity
+import androidx.fragment.app.FragmentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -46,6 +47,7 @@ import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
@@ -58,10 +60,15 @@ import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -70,12 +77,44 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import com.example.freelo.core.firebase.FirebaseClient
+import com.example.freelo.data.auth.AuthRepository
+import com.example.freelo.data.marketplace.MarketplaceRepository
+import com.example.freelo.domain.model.AccountRole
+import com.example.freelo.domain.model.UserProfile
+import com.example.freelo.domain.model.ServiceListing
+import com.example.freelo.ui.MarketplacePageContent
+import androidx.biometric.BiometricManager
+import androidx.biometric.BiometricPrompt
+import androidx.core.content.ContextCompat
+import com.example.freelo.ui.theme.FreeloTheme
 
 private val Blue = Color(0xFF1E88E5)
 private val Green = Color(0xFF43A047)
 private val Orange = Color(0xFFFB8C00)
 private val Canvas = Color(0xFFF5F7FA)
 private val Ink = Color(0xFF212121)
+private val InputTextStyle = TextStyle(
+    color = Ink,
+    fontFamily = FontFamily.Default,
+    fontSize = 16.sp
+)
+
+/** Keeps typed input, labels, cursor, and borders legible on Freelo's light surfaces. */
+@Composable
+private fun freeloInputColors() = OutlinedTextFieldDefaults.colors(
+    focusedTextColor = Ink,
+    unfocusedTextColor = Ink,
+    cursorColor = Blue,
+    focusedContainerColor = Color.White,
+    unfocusedContainerColor = Color.White,
+    focusedBorderColor = Blue,
+    unfocusedBorderColor = Color(0xFFB0BEC5),
+    focusedLabelColor = Blue,
+    unfocusedLabelColor = Color.DarkGray
+)
 
 private enum class UserRole(val label: String) {
     CLIENT("Cliente"), FREELANCER("Freelancer"), ADMIN("Administrador")
@@ -102,68 +141,133 @@ private val adminDestinations = listOf(
     Destination("reports", "Reportes", Icons.Default.Assessment)
 )
 
-class MainActivity : ComponentActivity() {
+class MainActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContent { FreeloApp() }
-    }
-}
-
-@Composable
-private fun FreeloApp() {
-    var role by remember { mutableStateOf(UserRole.CLIENT) }
-    var page by remember { mutableStateOf("splash") }
-    var previousPage by remember { mutableStateOf("home") }
-
-    MaterialTheme(
-        colorScheme = MaterialTheme.colorScheme.copy(
-            primary = Blue,
-            secondary = Green,
-            tertiary = Orange,
-            background = Canvas,
-            surface = Color.White,
-            onSurface = Ink
-        )
-    ) {
-        Surface(modifier = Modifier.fillMaxSize(), color = Canvas) {
-            when (page) {
-                "splash" -> SplashScreen { page = "login" }
-                "login" -> LoginScreen(
-                    role = role,
-                    onRoleChange = { role = it },
-                    onLogin = { page = if (role == UserRole.CLIENT) "home" else "dashboard" },
-                    onForgot = { page = "forgot" }
-                )
-                "forgot" -> RecoveryScreen(onBack = { page = "login" })
-                "biometric" -> BiometricScreen(
-                    onSuccess = { page = previousPage },
-                    onFallback = { page = "login" }
-                )
-                else -> MainShell(
-                    role = role,
-                    page = page,
-                    onNavigate = { page = it },
-                    onBiometric = { previousPage = page; page = "biometric" },
-                    onLogout = { page = "login" }
-                )
+        val clients = FirebaseClient.get(applicationContext)
+        val authRepository = AuthRepository(clients)
+        val marketplaceRepository = MarketplaceRepository(clients)
+        setContent {
+            FreeloTheme(darkTheme = false, dynamicColor = false) {
+                FreeloApp(authRepository, marketplaceRepository)
             }
         }
     }
 }
 
 @Composable
-private fun SplashScreen(onContinue: () -> Unit) {
-    Column(
-        modifier = Modifier.fillMaxSize().padding(28.dp),
-        verticalArrangement = Arrangement.Center,
-        horizontalAlignment = Alignment.CenterHorizontally
+private fun FreeloApp(authRepository: AuthRepository, marketplaceRepository: MarketplaceRepository) {
+    var role by remember { mutableStateOf(UserRole.CLIENT) }
+    var page by remember { mutableStateOf("splash") }
+    val history = remember { mutableStateListOf<String>() }
+    var previousPage by remember { mutableStateOf("home") }
+    var adminLoginOnly by remember { mutableStateOf(false) }
+    var signedInProfile by remember { mutableStateOf<UserProfile?>(null) }
+    var selectedService by remember { mutableStateOf<ServiceListing?>(null) }
+    var selectedOrderId by remember { mutableStateOf<String?>(null) }
+    var conversationId by remember { mutableStateOf<String?>(null) }
+
+    fun navigate(target: String) {
+        if (page != target) { history.add(page); page = target }
+    }
+    fun navigateRoot(target: String) { history.clear(); page = target }
+    fun roleHome(): String = if (role == UserRole.CLIENT) "home" else "dashboard"
+
+    BackHandler(enabled = page != "splash") {
+        if (history.isNotEmpty()) page = history.removeAt(history.lastIndex)
+        else when (page) {
+            "login" -> { page = "splash"; adminLoginOnly = false }
+            "register", "forgot" -> page = "login"
+            else -> navigateRoot(roleHome())
+        }
+    }
+
+    MaterialTheme(
+        colorScheme = MaterialTheme.colorScheme.copy(primary = Blue, secondary = Green, tertiary = Orange, background = Canvas, surface = Color.White, onSurface = Ink)
     ) {
-        BrandMark(large = true)
-        Spacer(Modifier.height(22.dp))
-        Text("Tu talento, más cerca", fontSize = 27.sp, fontWeight = FontWeight.Bold, color = Ink)
-        Text("Servicios locales hechos por personas expertas.", color = Color.Gray)
-        Spacer(Modifier.height(32.dp))
-        Button(onClick = onContinue, modifier = Modifier.fillMaxWidth()) { Text("Comenzar") }
+        Surface(modifier = Modifier.fillMaxSize(), color = Canvas) {
+            when (page) {
+                "splash" -> SplashScreen(
+                    onContinue = { adminLoginOnly = false; navigateRoot("login") },
+                    onAdminAccess = { adminLoginOnly = true; navigateRoot("login") }
+                )
+                "login" -> LoginScreen(
+                    authRepository = authRepository,
+                    adminOnly = adminLoginOnly,
+                    onLogin = { profile ->
+                        signedInProfile = profile; role = profile.role.toUiRole()
+                        navigateRoot(if (profile.role == AccountRole.CLIENT) "home" else "dashboard")
+                    },
+                    onBiometricLogin = { profile ->
+                        signedInProfile = profile; role = profile.role.toUiRole()
+                        navigateRoot(if (profile.role == AccountRole.CLIENT) "home" else "dashboard")
+                    },
+                    onForgot = { navigate("forgot") },
+                    onRegister = { navigate("register") },
+                    onBack = { adminLoginOnly = false; navigateRoot("splash") }
+                )
+                "register" -> RegistrationScreen(
+                    authRepository = authRepository,
+                    onRegistered = { profile ->
+                        signedInProfile = profile; role = profile.role.toUiRole()
+                        navigateRoot(if (profile.role == AccountRole.CLIENT) "home" else "dashboard")
+                    },
+                    onBack = { navigateRoot("login") }
+                )
+                "forgot" -> RecoveryScreen(authRepository = authRepository, onBack = { navigateRoot("login") })
+                else -> {
+                    val profile = signedInProfile
+                    if (profile == null) {
+                        LoginScreen(authRepository, adminLoginOnly, onLogin = { signedInProfile = it; role = it.role.toUiRole(); navigateRoot(if (it.role == AccountRole.CLIENT) "home" else "dashboard") },
+                            onBiometricLogin = { signedInProfile = it; role = it.role.toUiRole(); navigateRoot(if (it.role == AccountRole.CLIENT) "home" else "dashboard") },
+                            onForgot = { navigate("forgot") }, onRegister = { navigate("register") }, onBack = { navigateRoot("splash") })
+                    } else MainShell(
+                        role = role, profile = profile, page = page, repository = marketplaceRepository, authRepository = authRepository,
+                        selectedService = selectedService, onService = { selectedService = it }, selectedOrderId = selectedOrderId,
+                        onOrder = { selectedOrderId = it }, conversationId = conversationId, onConversation = { conversationId = it },
+                        onNavigate = ::navigate, onNavigateRoot = ::navigateRoot,
+                        onBiometric = { previousPage = page; navigate("biometric") },
+                        onProfileSaved = { signedInProfile = it },
+                        onLogout = { authRepository.signOut(); signedInProfile = null; selectedService = null; selectedOrderId = null; conversationId = null; history.clear(); navigateRoot("login") }
+                    )
+                }
+            }
+        }
+    }
+}
+
+private fun AccountRole.toUiRole(): UserRole = when (this) {
+    AccountRole.CLIENT -> UserRole.CLIENT
+    AccountRole.FREELANCER -> UserRole.FREELANCER
+    AccountRole.ADMIN -> UserRole.ADMIN
+}
+
+private fun UserRole.toAccountRole(): AccountRole = when (this) {
+    UserRole.CLIENT -> AccountRole.CLIENT
+    UserRole.FREELANCER -> AccountRole.FREELANCER
+    UserRole.ADMIN -> AccountRole.ADMIN
+}
+
+@Composable
+private fun SplashScreen(onContinue: () -> Unit, onAdminAccess: () -> Unit) {
+    Box(Modifier.fillMaxSize().padding(24.dp)) {
+        Column(
+            modifier = Modifier.fillMaxSize().padding(4.dp),
+            verticalArrangement = Arrangement.Center,
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            BrandMark(large = true)
+            Spacer(Modifier.height(22.dp))
+            Text("Tu talento, más cerca", fontSize = 27.sp, fontWeight = FontWeight.Bold, color = Ink)
+            Text("Servicios locales hechos por personas expertas.", color = Color.Gray)
+            Spacer(Modifier.height(32.dp))
+            Button(onClick = onContinue, modifier = Modifier.fillMaxWidth()) { Text("Comenzar") }
+        }
+        OutlinedButton(onClick = onAdminAccess, modifier = Modifier.align(Alignment.TopEnd)) {
+            androidx.compose.material3.Icon(Icons.Default.Lock, contentDescription = null, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(6.dp))
+            Text("Administrador")
+        }
     }
 }
 
@@ -178,45 +282,168 @@ private fun BrandMark(large: Boolean = false) {
 
 @Composable
 private fun LoginScreen(
-    role: UserRole,
-    onRoleChange: (UserRole) -> Unit,
-    onLogin: () -> Unit,
-    onForgot: () -> Unit
+    authRepository: AuthRepository,
+    adminOnly: Boolean,
+    onLogin: (UserProfile) -> Unit,
+    onBiometricLogin: (UserProfile) -> Unit,
+    onForgot: () -> Unit,
+    onRegister: () -> Unit,
+    onBack: () -> Unit
 ) {
+    var email by remember { mutableStateOf("") }
+    var password by remember { mutableStateOf("") }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
+    var loading by remember { mutableStateOf(false) }
+    var biometricMessage by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
+    val context = LocalContext.current
     Column(
         modifier = Modifier.fillMaxSize().padding(horizontal = 24.dp),
         verticalArrangement = Arrangement.Center
     ) {
         BrandMark()
         Spacer(Modifier.height(22.dp))
-        Text("Bienvenido a Freelo", fontSize = 28.sp, fontWeight = FontWeight.Bold)
-        Text("Encuentra talento local o comparte el tuyo.", color = Color.Gray)
+        Text(if (adminOnly) "Acceso de administrador" else "Bienvenido a Freelo", fontSize = 28.sp, fontWeight = FontWeight.Bold)
+        Text(
+            if (adminOnly) "Ingresa con una cuenta autorizada de administración."
+            else "Encuentra talento local o comparte el tuyo.",
+            color = Color.Gray
+        )
         Spacer(Modifier.height(22.dp))
-        Text("Entrar como", fontWeight = FontWeight.SemiBold)
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            UserRole.entries.forEach { item ->
-                FilterChip(selected = role == item, onClick = { onRoleChange(item) }, label = { Text(item.label) })
-            }
-        }
-        OutlinedTextField(value = "", onValueChange = {}, label = { Text("Correo electrónico") }, modifier = Modifier.fillMaxWidth())
+        OutlinedTextField(value = email, onValueChange = { email = it }, label = { Text("Correo electrónico") }, modifier = Modifier.fillMaxWidth(), singleLine = true, textStyle = InputTextStyle, colors = freeloInputColors())
         Spacer(Modifier.height(10.dp))
-        OutlinedTextField(value = "", onValueChange = {}, label = { Text("Contraseña") }, modifier = Modifier.fillMaxWidth())
+        OutlinedTextField(value = password, onValueChange = { password = it }, label = { Text("Contraseña") }, modifier = Modifier.fillMaxWidth(), visualTransformation = PasswordVisualTransformation(), singleLine = true, textStyle = InputTextStyle, colors = freeloInputColors())
         Text("¿Olvidaste tu contraseña?", color = Blue, modifier = Modifier.align(Alignment.End).clickable(onClick = onForgot).padding(12.dp))
-        Button(onClick = onLogin, modifier = Modifier.fillMaxWidth()) { Text("Iniciar sesión (demo)") }
+        errorMessage?.let { Text(it, color = Color(0xFFB00020), modifier = Modifier.padding(vertical = 6.dp)) }
+        Button(onClick = {
+            loading = true
+            errorMessage = null
+            scope.launch {
+                try {
+                    val profile = withContext(Dispatchers.IO) { authRepository.signIn(email, password) }
+                    if (adminOnly && profile.role != AccountRole.ADMIN) {
+                        authRepository.signOut()
+                        errorMessage = "Esta cuenta no tiene permisos de administrador."
+                    } else {
+                        onLogin(profile)
+                    }
+                } catch (error: Exception) {
+                    errorMessage = error.message ?: "No fue posible iniciar sesión. Revisa Firebase Emulator."
+                } finally { loading = false }
+            }
+        }, enabled = !loading, modifier = Modifier.fillMaxWidth()) { Text(if (loading) "Ingresando…" else "Iniciar sesión") }
+        if (authRepository.currentUid() != null) {
+            OutlinedButton(onClick = {
+                val activity = context as? FragmentActivity
+                if (activity == null) {
+                    biometricMessage = "La autenticación biométrica no está disponible en esta pantalla."
+                } else {
+                    val availability = BiometricManager.from(context).canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_WEAK)
+                    if (availability != BiometricManager.BIOMETRIC_SUCCESS) {
+                        biometricMessage = "Configura una huella en la seguridad del dispositivo para usar este acceso."
+                    } else {
+                        val prompt = BiometricPrompt(activity, ContextCompat.getMainExecutor(context), object : BiometricPrompt.AuthenticationCallback() {
+                            override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                                scope.launch {
+                                    loading = true
+                                    try {
+                                        val profile = withContext(Dispatchers.IO) { authRepository.restoreCurrentProfile() }
+                                        if (adminOnly && profile.role != AccountRole.ADMIN) {
+                                            biometricMessage = "La cuenta activa no tiene permisos de administrador."
+                                        } else {
+                                            onBiometricLogin(profile)
+                                        }
+                                    }
+                                    catch (error: Exception) { biometricMessage = error.message ?: "No fue posible restaurar la sesión." }
+                                    finally { loading = false }
+                                }
+                            }
+                            override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                                biometricMessage = errString.toString()
+                            }
+                        })
+                        prompt.authenticate(BiometricPrompt.PromptInfo.Builder()
+                            .setTitle("Iniciar sesión en Freelo")
+                            .setSubtitle("Confirma tu identidad con huella o biometría del dispositivo")
+                            .setNegativeButtonText("Usar contraseña")
+                            .build())
+                    }
+                }
+            }, enabled = !loading, modifier = Modifier.fillMaxWidth()) { Text("Ingresar con huella") }
+        }
+        biometricMessage?.let { Text(it, color = Color.Gray, fontSize = 12.sp, modifier = Modifier.padding(top = 6.dp)) }
         Spacer(Modifier.height(8.dp))
-        OutlinedButton(onClick = onLogin, modifier = Modifier.fillMaxWidth()) { Text("Crear cuenta") }
-        Text("La selección de rol es solo para explorar esta demostración.", color = Color.Gray, fontSize = 12.sp, modifier = Modifier.padding(top = 12.dp))
+        if (adminOnly) {
+            Text("Volver", color = Blue, modifier = Modifier.align(Alignment.CenterHorizontally).clickable(onClick = onBack).padding(12.dp))
+        } else {
+            OutlinedButton(onClick = onRegister, modifier = Modifier.fillMaxWidth()) { Text("Crear cuenta") }
+            Text("El rol se asigna al registrar la cuenta y se valida desde el perfil.", color = Color.Gray, fontSize = 12.sp, modifier = Modifier.padding(top = 12.dp))
+        }
     }
 }
 
 @Composable
-private fun RecoveryScreen(onBack: () -> Unit) {
+private fun RegistrationScreen(authRepository: AuthRepository, onRegistered: (UserProfile) -> Unit, onBack: () -> Unit) {
+    var name by remember { mutableStateOf("") }
+    var email by remember { mutableStateOf("") }
+    var password by remember { mutableStateOf("") }
+    var role by remember { mutableStateOf(AccountRole.CLIENT) }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
+    var loading by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(24.dp), verticalArrangement = Arrangement.Center) {
+        Text("Crear cuenta", fontSize = 26.sp, fontWeight = FontWeight.Bold)
+        Text("Regístrate para contratar servicios o publicarlos.", color = Color.Gray, modifier = Modifier.padding(vertical = 10.dp))
+        OutlinedTextField(name, { name = it }, label = { Text("Nombre completo") }, modifier = Modifier.fillMaxWidth(), singleLine = true, textStyle = InputTextStyle, colors = freeloInputColors())
+        OutlinedTextField(email, { email = it }, label = { Text("Correo electrónico") }, modifier = Modifier.fillMaxWidth().padding(top = 8.dp), singleLine = true, textStyle = InputTextStyle, colors = freeloInputColors())
+        OutlinedTextField(password, { password = it }, label = { Text("Contraseña (mínimo 8 caracteres)") }, modifier = Modifier.fillMaxWidth().padding(top = 8.dp), visualTransformation = PasswordVisualTransformation(), singleLine = true, textStyle = InputTextStyle, colors = freeloInputColors())
+        Text("Tipo de cuenta", fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(top = 12.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            listOf(
+                AccountRole.CLIENT to "Cliente",
+                AccountRole.FREELANCER to "Freelancer",
+                AccountRole.ADMIN to "Administrador"
+            ).forEach { (value, label) ->
+                FilterChip(selected = role == value, onClick = { role = value }, label = { Text(label) })
+            }
+        }
+        errorMessage?.let { Text(it, color = Color(0xFFB00020), modifier = Modifier.padding(vertical = 6.dp)) }
+        Button(onClick = {
+            loading = true; errorMessage = null
+            scope.launch {
+                try { onRegistered(withContext(Dispatchers.IO) { authRepository.register(name, email, password, role) }) }
+                catch (error: Exception) { errorMessage = error.message ?: "No fue posible crear la cuenta." }
+                finally { loading = false }
+            }
+        }, enabled = !loading, modifier = Modifier.fillMaxWidth().padding(top = 10.dp)) { Text(if (loading) "Creando cuenta…" else "Crear cuenta") }
+        Text("Volver al inicio de sesión", color = Blue, modifier = Modifier.clickable(onClick = onBack).padding(12.dp))
+    }
+}
+
+@Composable
+private fun RecoveryScreen(authRepository: AuthRepository, onBack: () -> Unit) {
+    var email by remember { mutableStateOf("") }
+    var message by remember { mutableStateOf<String?>(null) }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
+    var loading by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
     Column(Modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.Center) {
         Text("Recuperar contraseña", fontSize = 26.sp, fontWeight = FontWeight.Bold)
         Text("Te enviaremos instrucciones al correo asociado a tu cuenta.", color = Color.Gray, modifier = Modifier.padding(vertical = 12.dp))
-        OutlinedTextField(value = "", onValueChange = {}, label = { Text("Correo electrónico") }, modifier = Modifier.fillMaxWidth())
+        OutlinedTextField(value = email, onValueChange = { email = it }, label = { Text("Correo electrónico") }, modifier = Modifier.fillMaxWidth(), singleLine = true, textStyle = InputTextStyle, colors = freeloInputColors())
         Spacer(Modifier.height(16.dp))
-        Button(onClick = onBack, modifier = Modifier.fillMaxWidth()) { Text("Enviar instrucciones (demo)") }
+        message?.let { Text(it, color = Green) }
+        errorMessage?.let { Text(it, color = Color(0xFFB00020)) }
+        Button(onClick = {
+            loading = true; errorMessage = null; message = null
+            scope.launch {
+                try {
+                    withContext(Dispatchers.IO) { authRepository.sendPasswordReset(email) }
+                    message = "Si el correo está registrado, Firebase Emulator procesó la solicitud de recuperación."
+                } catch (error: Exception) { errorMessage = error.message ?: "No fue posible enviar la solicitud." }
+                finally { loading = false }
+            }
+        }, enabled = !loading, modifier = Modifier.fillMaxWidth()) { Text(if (loading) "Enviando…" else "Enviar instrucciones") }
         Text("Volver al inicio de sesión", color = Blue, modifier = Modifier.clickable(onClick = onBack).padding(12.dp))
     }
 }
@@ -240,9 +467,20 @@ private fun BiometricScreen(onSuccess: () -> Unit, onFallback: () -> Unit) {
 @Composable
 private fun MainShell(
     role: UserRole,
+    profile: UserProfile,
     page: String,
+    repository: MarketplaceRepository,
+    authRepository: AuthRepository,
+    selectedService: ServiceListing?,
+    onService: (ServiceListing?) -> Unit,
+    selectedOrderId: String?,
+    onOrder: (String) -> Unit,
+    conversationId: String?,
+    onConversation: (String) -> Unit,
     onNavigate: (String) -> Unit,
+    onNavigateRoot: (String) -> Unit,
     onBiometric: () -> Unit,
+    onProfileSaved: (UserProfile) -> Unit,
     onLogout: () -> Unit
 ) {
     val drawerState = rememberDrawerState(DrawerValue.Closed)
@@ -264,13 +502,13 @@ private fun MainShell(
                     Spacer(Modifier.height(12.dp))
                     allDestinations(role).forEach { item ->
                         DrawerRow(item, selected = item.id == page) {
-                            onNavigate(item.id)
+                            onNavigateRoot(item.id)
                             scope.launch { drawerState.close() }
                         }
                     }
                     HorizontalDivider(Modifier.padding(vertical = 8.dp))
                     DrawerRow(Destination("biometric", "Acceso biométrico", Icons.Default.Lock), false, onBiometric)
-                    DrawerRow(Destination("settings", "Configuración", Icons.Default.Settings), page == "settings") { onNavigate("settings") }
+                    DrawerRow(Destination("settings", "Configuración", Icons.Default.Settings), page == "settings") { onNavigateRoot("settings") }
                     DrawerRow(Destination("logout", "Cerrar sesión", Icons.AutoMirrored.Filled.ArrowBack), false, onLogout)
                 }
             }
@@ -297,7 +535,7 @@ private fun MainShell(
                     destinations.forEach { item ->
                         NavigationBarItem(
                             selected = page == item.id,
-                            onClick = { onNavigate(item.id) },
+                            onClick = { onNavigateRoot(item.id) },
                             icon = { androidx.compose.material3.Icon(item.icon, contentDescription = item.title) },
                             label = { Text(item.title, maxLines = 1, overflow = TextOverflow.Ellipsis) }
                         )
@@ -305,7 +543,13 @@ private fun MainShell(
                 }
             }
         ) { padding ->
-            PageContent(role, page, Modifier.padding(padding), onNavigate)
+            MarketplacePageContent(
+                role = role.toAccountRole(), profile = profile, page = page, repository = repository,
+                auth = authRepository, modifier = Modifier.padding(padding), service = selectedService,
+                onService = onService, orderId = selectedOrderId, onOrder = onOrder,
+                conversationId = conversationId, onConversationSelected = onConversation, onNavigate = onNavigate,
+                onProfileSaved = onProfileSaved, onLogout = onLogout
+            )
         }
     }
 }
@@ -329,24 +573,20 @@ private fun allDestinations(role: UserRole): List<Destination> = when (role) {
         Destination("cart", "Carrito", Icons.Default.ShoppingCart),
         Destination("checkout", "Checkout y pago", Icons.Default.Lock),
         Destination("order_detail", "Detalle del pedido", Icons.Default.ShoppingBag),
-        Destination("messages", "Mensajes", Icons.AutoMirrored.Filled.Chat),
-        Destination("settings", "Configuración", Icons.Default.Settings)
+        Destination("messages", "Mensajes", Icons.AutoMirrored.Filled.Chat)
     )
     UserRole.FREELANCER -> freelancerDestinations + listOf(
         Destination("messages", "Mensajes", Icons.AutoMirrored.Filled.Chat),
         Destination("earnings", "Ganancias", Icons.Default.Assessment),
-        Destination("service_form", "Crear servicio", Icons.Default.Storefront),
-        Destination("settings", "Configuración", Icons.Default.Settings)
+        Destination("service_form", "Crear servicio", Icons.Default.Storefront)
     )
     UserRole.ADMIN -> adminDestinations + listOf(
-        Destination("reports", "Reportes", Icons.Default.Assessment),
-        Destination("settings", "Configuración", Icons.Default.Settings),
         Destination("audit", "Auditoría", Icons.Default.Lock)
     )
 }
 
 @Composable
-private fun PageContent(role: UserRole, page: String, modifier: Modifier, onNavigate: (String) -> Unit) {
+private fun PageContent(role: UserRole, profile: UserProfile?, page: String, modifier: Modifier, onNavigate: (String) -> Unit, onLogout: () -> Unit) {
     when (page) {
         "home" -> ClientHome(modifier, onNavigate)
         "dashboard" -> DashboardPage(role, modifier, onNavigate)
@@ -354,7 +594,7 @@ private fun PageContent(role: UserRole, page: String, modifier: Modifier, onNavi
         "services" -> ServicesPage(role, modifier, onNavigate)
         "users" -> UsersPage(modifier, onNavigate)
         "orders" -> OrdersPage(role, modifier, onNavigate)
-        "profile" -> ProfilePage(role, modifier, onNavigate)
+        "profile" -> ProfilePage(role, profile, modifier, onNavigate, onLogout)
         "detail" -> ServiceDetail(modifier, onNavigate)
         "freelancer" -> FreelancerProfile(modifier, onNavigate)
         "cart" -> CartPage(modifier, onNavigate)
@@ -493,20 +733,20 @@ private fun OrdersPage(role: UserRole, modifier: Modifier, onNavigate: (String) 
 }
 
 @Composable
-private fun ProfilePage(role: UserRole, modifier: Modifier, onNavigate: (String) -> Unit) {
+private fun ProfilePage(role: UserRole, profile: UserProfile?, modifier: Modifier, onNavigate: (String) -> Unit, onLogout: () -> Unit) {
     PageColumn(modifier) {
         Text("Mi perfil", fontSize = 22.sp, fontWeight = FontWeight.Bold)
         Card(Modifier.fillMaxWidth().padding(vertical = 12.dp), colors = CardDefaults.cardColors(containerColor = Color.White)) {
             Column(Modifier.fillMaxWidth().padding(18.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                 Box(Modifier.size(76.dp).background(Color(0xFFE3F2FD), CircleShape), contentAlignment = Alignment.Center) { androidx.compose.material3.Icon(Icons.Default.AccountCircle, null, tint = Blue, modifier = Modifier.size(52.dp)) }
-                Text(if (role == UserRole.CLIENT) "Alex Ramírez" else "Laura Méndez", fontSize = 20.sp, fontWeight = FontWeight.Bold)
-                Text(if (role == UserRole.FREELANCER) "Diseñadora · Bogotá · ⭐ 4.9" else "alex@email.com", color = Color.Gray)
-                Text("Editar perfil", color = Blue, modifier = Modifier.clickable { onNavigate("settings") }.padding(8.dp))
+                Text(profile?.name ?: "Usuario Freelo", fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                Text(profile?.email ?: role.label, color = Color.Gray)
+                Text("Editar perfil", color = Blue, modifier = Modifier.clickable { onNavigate("profile_edit") }.padding(8.dp))
             }
         }
-        ActionCard("Configuración y privacidad", "Preferencias, consentimiento y seguridad") { onNavigate("settings") }
+        ActionCard("Configuración y privacidad", "Preferencias, consentimiento y seguridad") { onNavigate("profile_edit") }
         ActionCard("Acceso biométrico", "Protege el acceso a tu cuenta") { onNavigate("biometric") }
-        ActionCard("Cerrar sesión", "Salir de Freelo en este dispositivo") { onNavigate("settings") }
+        ActionCard("Cerrar sesión", "Salir de Freelo en este dispositivo", onLogout)
     }
 }
 

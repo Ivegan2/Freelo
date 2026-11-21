@@ -1,0 +1,45 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isActiveFreelancer(uid) {
+      return signedIn()
+        && request.auth.uid == uid
+        && firestore.get(/databases/(default)/documents/users/$(uid)).data.role == 'freelancer'
+        && firestore.get(/databases/(default)/documents/users/$(uid)).data.active == true;
+    }
+
+    function isActiveAdmin() {
+      return signedIn()
+        && firestore.get(/databases/(default)/documents/users/$(request.auth.uid)).data.role == 'admin'
+        && firestore.get(/databases/(default)/documents/users/$(request.auth.uid)).data.active == true;
+    }
+
+    function isValidImage() {
+      return request.resource.size < 5 * 1024 * 1024
+        && request.resource.contentType.matches('image/.*');
+    }
+
+    match /services/{uid}/{serviceId}/{fileName} {
+      allow read: if true;
+      allow create, update: if isActiveFreelancer(uid) && isValidImage();
+      allow delete: if isActiveFreelancer(uid) || isActiveAdmin();
+    }
+
+    match /profiles/{uid}/{fileName} {
+      allow read: if true;
+      allow create, update: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.size < 3 * 1024 * 1024
+        && request.resource.contentType.matches('image/.*');
+      allow delete: if signedIn() && request.auth.uid == uid;
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

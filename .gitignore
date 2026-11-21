@@ -1,5 +1,10 @@
 *.iml
 .gradle
+**/build/
+.kotlin/
+.firebase/
+node_modules/
+*-debug.log
 /local.properties
 /.idea/caches
 /.idea/libraries
